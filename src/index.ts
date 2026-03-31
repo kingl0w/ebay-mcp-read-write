@@ -8,8 +8,16 @@ import helmet from "helmet";
 import { createListing, createListingSchema } from "./tools/create-listing.js";
 import { draftListing, draftListingSchema } from "./tools/draft-listing.js";
 import { endListing, endListingSchema } from "./tools/end-listing.js";
+import {
+  getCategoryAspects,
+  getCategoryAspectsSchema,
+} from "./tools/get-category-aspects.js";
 import { getListings, getListingsSchema } from "./tools/get-listings.js";
 import { reviseListing, reviseListingSchema } from "./tools/revise-listing.js";
+import {
+  searchCategories,
+  searchCategoriesSchema,
+} from "./tools/search-categories.js";
 import {
   getUploadUrl,
   getUploadUrlSchema,
@@ -183,10 +191,7 @@ function createServer(): McpServer {
     "Get curl commands to upload local image files directly to cloud storage. Use this when you have local image files (e.g. /mnt/user-data/uploads/photo.jpg) that need to be uploaded to R2 for eBay listings. Run the returned curl commands in bash, then use the returned image_url values in your listing.",
     getUploadUrlSchema.shape,
     async (params) => {
-      logger.info(
-        { tool: "get_upload_url", input: params },
-        "Tool called",
-      );
+      logger.info({ tool: "get_upload_url", input: params }, "Tool called");
       try {
         const result = getUploadUrl(params);
         return {
@@ -196,6 +201,51 @@ function createServer(): McpServer {
         logger.error(
           { error, input: params },
           "Tool execution failed: get_upload_url",
+        );
+        throw error;
+      }
+    },
+  );
+
+  server.tool(
+    "search_categories",
+    "Search for eBay category IDs by product name or keywords. Use this to find the correct category_id before creating a listing or fetching category-specific item specifics.",
+    searchCategoriesSchema.shape,
+    async (params) => {
+      logger.info({ tool: "search_categories", input: params }, "Tool called");
+      try {
+        const result = await searchCategories(params);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error) {
+        logger.error(
+          { error, input: params },
+          "Tool execution failed: search_categories",
+        );
+        throw error;
+      }
+    },
+  );
+
+  server.tool(
+    "get_category_aspects",
+    "Get required, recommended, and optional item specifics for an eBay category. Use this after identifying the category to know exactly which attributes (Brand, Size, Color, UPC, etc.) to extract from product images.",
+    getCategoryAspectsSchema.shape,
+    async (params) => {
+      logger.info(
+        { tool: "get_category_aspects", input: params },
+        "Tool called",
+      );
+      try {
+        const result = await getCategoryAspects(params);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error) {
+        logger.error(
+          { error, input: params },
+          "Tool execution failed: get_category_aspects",
         );
         throw error;
       }
@@ -306,7 +356,10 @@ async function handleFiles(files){
 
   app.post(
     "/upload",
-    express.raw({ type: ["application/octet-stream", "image/*"], limit: "20mb" }),
+    express.raw({
+      type: ["application/octet-stream", "image/*"],
+      limit: "20mb",
+    }),
     async (req, res) => {
       try {
         const filename = req.query.filename as string;
@@ -318,9 +371,9 @@ async function handleFiles(files){
         res.json(result);
       } catch (error) {
         logger.error({ error }, "Direct upload failed");
-        res
-          .status(500)
-          .json({ error: error instanceof Error ? error.message : "Upload failed" });
+        res.status(500).json({
+          error: error instanceof Error ? error.message : "Upload failed",
+        });
       }
     },
   );
