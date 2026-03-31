@@ -1,0 +1,9 @@
+services:
+  ebay-mcp:
+    build: .
+    env_file: .env
+    environment:
+      - MCP_TRANSPORT=http
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
