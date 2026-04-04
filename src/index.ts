@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import "dotenv/config";
 import express from "express";
@@ -267,6 +268,7 @@ async function startHttp() {
   app.set("trust proxy", 1);
   const port = Number(process.env.PORT ?? 3100);
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+  const sseSessions = new Map<string, SSEServerTransport>();
 
   app.use(helmet({ contentSecurityPolicy: false }));
 
@@ -293,15 +295,21 @@ async function startHttp() {
   });
 
   const mcpSecret = process.env.MCP_SECRET;
-  if (mcpSecret) {
-    app.use("/mcp", (req, res, next) => {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${mcpSecret}`) {
-        res.status(401).json({ error: "Unauthorized" });
-        return;
-      }
+  function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (!mcpSecret) {
       next();
-    });
+      return;
+    }
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${mcpSecret}`) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    next();
+  }
+
+  if (mcpSecret) {
+    app.use("/mcp", requireAuth);
   }
 
   app.get("/health", (_req, res) => {
@@ -313,6 +321,11 @@ async function startHttp() {
     res.send(`<!DOCTYPE html><html><head><title>Image Upload</title>
 <style>
 body{font-family:system-ui;max-width:600px;margin:40px auto;padding:0 20px}
+#auth{margin:40px 0;text-align:center}
+#auth input{padding:10px;width:300px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+#auth button{padding:10px 20px;margin-left:8px;border:none;background:#4CAF50;color:#fff;border-radius:6px;cursor:pointer;font-size:14px}
+#auth .error{color:#f44336;margin-top:8px}
+#app{display:none}
 #drop{border:3px dashed #ccc;border-radius:12px;padding:60px 20px;text-align:center;margin:20px 0;cursor:pointer;transition:.2s}
 #drop.over{border-color:#4CAF50;background:#f0fff0}
 #drop input{display:none}
@@ -324,13 +337,32 @@ body{font-family:system-ui;max-width:600px;margin:40px auto;padding:0 20px}
 img.preview{max-width:200px;max-height:150px;margin:5px;border-radius:4px}
 </style></head><body>
 <h2>📸 Upload Images to R2</h2>
+<div id="auth">
+<p>Enter your upload token to continue.</p>
+<input type="password" id="token" placeholder="Token" onkeydown="if(event.key==='Enter')doAuth()">
+<button onclick="doAuth()">Unlock</button>
+<div id="auth-error"></div>
+</div>
+<div id="app">
 <p>Drag & drop images here, or click to select. URLs will be copied to clipboard.</p>
 <div id="drop" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="handleDrop(event)" onclick="this.querySelector('input').click()">
 <input type="file" multiple accept="image/*" onchange="handleFiles(this.files)">
 <p>📁 Drop images here or click to browse</p>
 </div>
 <div id="results"></div>
+</div>
 <script>
+let authToken=sessionStorage.getItem('upload_token')||'';
+if(authToken)showApp();
+function doAuth(){
+  authToken=document.getElementById('token').value.trim();
+  if(!authToken){document.getElementById('auth-error').textContent='Token required';return}
+  fetch('/upload?filename=test.ping',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/octet-stream'},body:new ArrayBuffer(0)}).then(r=>{
+    if(r.status===401){document.getElementById('auth-error').textContent='Invalid token';return}
+    sessionStorage.setItem('upload_token',authToken);showApp();
+  }).catch(()=>{document.getElementById('auth-error').textContent='Connection error'});
+}
+function showApp(){document.getElementById('auth').style.display='none';document.getElementById('app').style.display='block'}
 function handleDrop(e){e.preventDefault();document.getElementById('drop').classList.remove('over');handleFiles(e.dataTransfer.files)}
 async function handleFiles(files){
   const results=document.getElementById('results');
@@ -342,7 +374,8 @@ async function handleFiles(files){
     results.prepend(div);
     try{
       const buf=await file.arrayBuffer();
-      const r=await fetch('/upload?filename='+encodeURIComponent(file.name),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:buf});
+      const r=await fetch('/upload?filename='+encodeURIComponent(file.name),{method:'POST',headers:{'Content-Type':'application/octet-stream','Authorization':'Bearer '+authToken},body:buf});
+      if(r.status===401){div.innerHTML+='<br><span class="error">Token expired — reload page</span>';return}
       const j=await r.json();
       if(j.image_url){
         div.innerHTML='';div.appendChild(img);
@@ -356,6 +389,7 @@ async function handleFiles(files){
 
   app.post(
     "/upload",
+    requireAuth,
     express.raw({
       type: ["application/octet-stream", "image/*"],
       limit: "20mb",
@@ -427,12 +461,39 @@ async function handleFiles(files){
     res.status(200).end();
   });
 
-  app.listen(port, () => {
+  // SSE transport (deprecated protocol version 2024-11-05, needed for claude.ai)
+  app.get("/sse", async (req, res) => {
+    const transport = new SSEServerTransport("/messages", res);
+    sseSessions.set(transport.sessionId, transport);
+    logger.debug({ sessionId: transport.sessionId }, "SSE session created");
+
+    res.on("close", () => {
+      sseSessions.delete(transport.sessionId);
+      logger.debug({ sessionId: transport.sessionId }, "SSE session closed");
+    });
+
+    const server = createServer();
+    await server.connect(transport);
+  });
+
+  app.post("/messages", async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = sseSessions.get(sessionId);
+    if (!transport) {
+      res.status(400).json({ error: "No SSE session found for sessionId" });
+      return;
+    }
+    await transport.handlePostMessage(req, res, req.body);
+  });
+
+  app.listen(port, "127.0.0.1", () => {
     logger.info(
-      { port, transport: "http" },
+      { port, transport: "http+sse" },
       `eBay MCP server started on http://localhost:${port}`,
     );
-    logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
+    logger.info(`Streamable HTTP endpoint: http://localhost:${port}/mcp`);
+    logger.info(`SSE endpoint: http://localhost:${port}/sse`);
+    logger.info(`SSE message endpoint: http://localhost:${port}/messages`);
   });
 }
 

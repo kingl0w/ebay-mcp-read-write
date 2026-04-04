@@ -171,9 +171,11 @@ export function getUploadUrl(input: GetUploadUrlInput): {
 } {
   const baseUrl =
     process.env.UPLOAD_BASE_URL ?? `http://localhost:${process.env.PORT ?? 3100}`;
+  const mcpSecret = process.env.MCP_SECRET;
+  const authHeader = mcpSecret ? ` -H "Authorization: Bearer ${mcpSecret}"` : "";
   const commands = input.filenames.map(
     (f) =>
-      `curl -s -X POST "${baseUrl}/upload?filename=${encodeURIComponent(f)}" --data-binary @/path/to/${f} -H "Content-Type: application/octet-stream"`,
+      `curl -s -X POST "${baseUrl}/upload?filename=${encodeURIComponent(f)}" --data-binary @/path/to/${f} -H "Content-Type: application/octet-stream"${authHeader}`,
   );
 
   return {
